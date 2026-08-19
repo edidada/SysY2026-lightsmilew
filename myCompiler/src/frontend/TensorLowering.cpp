@@ -11,33 +11,63 @@ namespace
 {
 using Shape = std::vector<int>;
 
-//获取常量int
-int constInt(const Ptr<ExprNode> &e)
+int constInt(const Ptr<ExprNode> &e, const std::unordered_map<std::string, int> &consts)
 {
     if (auto il = castPtr<IntLiteralExprNode>(e))
         return il->value;
+    if (auto fl = castPtr<FloatLiteralExprNode>(e))
+        return static_cast<int>(fl->value);
+    if (auto lv = castPtr<LValueExprNode>(e))
+    {
+        if (lv->indices.empty())
+        {
+            auto it = consts.find(lv->identifier);
+            if (it != consts.end())
+                return it->second;
+        }
+    }
     if (auto un = castPtr<UnaryExprNode>(e))
     {
         if (un->op == UnaryOp::Minus)
-            return -constInt(un->operand);
+            return -constInt(un->operand, consts);
         if (un->op == UnaryOp::Plus)
-            return constInt(un->operand);
+            return constInt(un->operand, consts);
+    }
+    if (auto b = castPtr<BinaryExprNode>(e))
+    {
+        int l = constInt(b->left, consts);
+        int r = constInt(b->right, consts);
+        switch (b->op)
+        {
+        case BinaryOp::Add:
+            return l + r;
+        case BinaryOp::Sub:
+            return l - r;
+        case BinaryOp::Mul:
+            return l * r;
+        case BinaryOp::Div:
+            return r == 0 ? 0 : l / r;
+        case BinaryOp::Mod:
+            return r == 0 ? 0 : l % r;
+        default:
+            break;
+        }
     }
     throw std::runtime_error("Tensor dimension must be a constant,line: " +
                              std::to_string(e ? e->line : 0));
 }
-//保留维度信息
-Shape dimsOf(const DataType &ty)
+
+Shape dimsOf(const DataType &ty, const std::unordered_map<std::string, int> &consts)
 {
     Shape s;
     for (auto &e : ty.arraySizes())
     {
-        int v = constInt(e);
+        int v = constInt(e, consts);
         s.push_back(v > 0 ? v : -1);
     }
     return s;
 }
-//复制原来的数组type
+
 DataType arrayType(PrimaryDataType base, const Shape &s)
 {
     Vector<Ptr<ExprNode>> idxs;
@@ -45,26 +75,33 @@ DataType arrayType(PrimaryDataType base, const Shape &s)
         idxs.emplace_back(makePtr<IntLiteralExprNode>(d < 0 ? -1 : d));
     return DataType(base, std::move(idxs));
 }
-//写回维度，之前没确定为-1
+
 void fillShape(Shape &dst, const Shape &from)
 {
     for (size_t i = 0; i < dst.size() && i < from.size(); ++i)
         if (dst[i] < 0 && from[i] > 0)
             dst[i] = from[i];
 }
-//判断是否为支持的tensor二元运算
+
 bool isElemOp(BinaryOp op)
 {
     return op == BinaryOp::Add || op == BinaryOp::Sub || op == BinaryOp::Mul ||
            op == BinaryOp::Div || op == BinaryOp::Mod;
 }
 
+Vector<Ptr<ExprNode>> cloneIdx(const Vector<Ptr<ExprNode>> &idx)
+{
+    Vector<Ptr<ExprNode>> c;
+    c.reserve(idx.size());
+    for (auto &x : idx)
+        c.push_back(x);
+    return c;
+}
+
 struct FuncSig
 {
     bool hasSret = false;
-    //返回值形状
     Shape retShape;
-    //返回值基础类型
     PrimaryDataType retBase = PrimaryDataType::INT;
     std::vector<char> omitFirst;
     std::vector<Shape> paramShapes;
@@ -74,36 +111,120 @@ struct Lowering
 {
     unsigned tmp = 0;
     unsigned line = 0;
-    //签名
     std::unordered_map<std::string, FuncSig> sigs;
-    //全局数组维度
     std::unordered_map<std::string, Shape> gloabl_shapes;
-    //std::unordered_map<std::string, PrimaryDataType> gloabl_bases;
-    //当前数组维度信息
+    std::unordered_map<std::string, PrimaryDataType> gloabl_bases;
     std::unordered_map<std::string, Shape> shapes;
-    //数组基类信息
     std::unordered_map<std::string, PrimaryDataType> bases;
     std::unordered_map<std::string, std::string> extOf;
-    //当前函数签名
+    std::unordered_map<std::string, int> constInts;
     FuncSig *cur = nullptr;
-    
+
+    void noteConstDecl(const Ptr<DeclStmtNode> &d)
+    {
+        if (!d || !d->type.isConst() || d->type.isArray())
+            return;
+        if (d->type.baseType != PrimaryDataType::INT)
+            return;
+        if (!d->initializer || !d->initializer->singleInitVal)
+            return;
+        try
+        {
+            constInts[d->identifier] = constInt(d->initializer->singleInitVal, constInts);
+        }
+        catch (const std::runtime_error &)
+        {
+        }
+    }
+
+    struct NameSave
+    {
+        bool hadShape = false;
+        Shape sh;
+        PrimaryDataType base = PrimaryDataType::INT;
+        bool hadExt = false;
+        std::string ext;
+    };
+    std::vector<std::unordered_map<std::string, NameSave>> scopes;
+
+    void pushScope() { scopes.emplace_back(); }
+    void popScope()
+    {
+        if (scopes.empty())
+            return;
+        for (auto &kv : scopes.back())
+        {
+            const std::string &id = kv.first;
+            const NameSave &sv = kv.second;
+            if (sv.hadShape)
+            {
+                shapes[id] = sv.sh;
+                bases[id] = sv.base;
+            }
+            else
+            {
+                shapes.erase(id);
+                bases.erase(id);
+            }
+            if (sv.hadExt)
+                extOf[id] = sv.ext;
+            else
+                extOf.erase(id);
+        }
+        scopes.pop_back();
+    }
+    void checkpoint(const std::string &id)
+    {
+        if (scopes.empty() || scopes.back().count(id))
+            return;
+        NameSave sv;
+        auto it = shapes.find(id);
+        sv.hadShape = it != shapes.end();
+        if (sv.hadShape)
+        {
+            sv.sh = it->second;
+            sv.base = baseOf(id);
+        }
+        auto eit = extOf.find(id);
+        sv.hadExt = eit != extOf.end();
+        if (sv.hadExt)
+            sv.ext = eit->second;
+        scopes.back()[id] = std::move(sv);
+    }
+    void bindArray(const std::string &id, const Shape &s, PrimaryDataType base)
+    {
+        checkpoint(id);
+        shapes[id] = s;
+        bases[id] = base;
+    }
+    void bindScalar(const std::string &id)
+    {
+        checkpoint(id);
+        shapes.erase(id);
+        bases.erase(id);
+        extOf.erase(id);
+    }
+
     std::string fresh(const char *p)
     {
         return std::string(p) + std::to_string(tmp++);
     }
 
-    template <class T>
-    Ptr<T> tagged(Ptr<T> n)
-    {
-        n->line = line;
-        return n;
-    }
-    //生成一个字面量表达式
     Ptr<IntLiteralExprNode> lit(int v)
     {
         auto n = makePtr<IntLiteralExprNode>(v);
         n->line = line;
         return n;
+    }
+    Ptr<ExprNode> zeroOf(PrimaryDataType ty)
+    {
+        if (ty == PrimaryDataType::FLOAT)
+        {
+            auto n = makePtr<FloatLiteralExprNode>(0.0f);
+            n->line = line;
+            return n;
+        }
+        return lit(0);
     }
     Ptr<LValueExprNode> lval(const std::string &id, Vector<Ptr<ExprNode>> idx = {})
     {
@@ -117,9 +238,10 @@ struct Lowering
         n->line = line;
         return n;
     }
-    Ptr<DeclStmtNode> declScalar(const std::string &id, Ptr<ExprNode> init)
+    Ptr<DeclStmtNode> declScalar(const std::string &id, Ptr<ExprNode> init,
+                                 PrimaryDataType ty = PrimaryDataType::INT)
     {
-        auto n = makePtr<DeclStmtNode>(DataType(PrimaryDataType::INT), id,
+        auto n = makePtr<DeclStmtNode>(DataType(ty), id,
                                        makePtr<InitExprNode>(std::move(init)));
         n->line = line;
         return n;
@@ -128,8 +250,7 @@ struct Lowering
     {
         auto n = makePtr<DeclStmtNode>(arrayType(base, s), id);
         n->line = line;
-        shapes[id] = s;
-        bases[id] = base;
+        bindArray(id, s, base);
         return n;
     }
     Ptr<AssignStmtNode> assign(Ptr<LValueExprNode> lv, Ptr<ExprNode> rv)
@@ -145,24 +266,69 @@ struct Lowering
         return it != shapes.end() && !it->second.empty();
     }
 
+    Shape remainingShape(const std::string &id, size_t nIdx) const
+    {
+        auto it = shapes.find(id);
+        if (it == shapes.end() || nIdx > it->second.size())
+            return {};
+        if (nIdx == it->second.size())
+            return {};
+        return Shape(it->second.begin() + static_cast<long>(nIdx), it->second.end());
+    }
+
+    PrimaryDataType baseOf(const std::string &id) const
+    {
+        auto it = bases.find(id);
+        return it == bases.end() ? PrimaryDataType::INT : it->second;
+    }
+
+    PrimaryDataType inferBase(const Ptr<ExprNode> &e)
+    {
+        if (auto lv = castPtr<LValueExprNode>(e))
+            return baseOf(lv->identifier);
+        if (auto call = castPtr<CallExprNode>(e))
+        {
+            auto it = sigs.find(call->callee);
+            if (it != sigs.end() && it->second.hasSret)
+                return it->second.retBase;
+        }
+        if (auto un = castPtr<UnaryExprNode>(e))
+            return inferBase(un->operand);
+        if (auto b = castPtr<BinaryExprNode>(e))
+        {
+            if (isTensorValued(b->left))
+                return inferBase(b->left);
+            if (isTensorValued(b->right))
+                return inferBase(b->right);
+            return inferBase(b->left);
+        }
+        if (castPtr<FloatLiteralExprNode>(e))
+            return PrimaryDataType::FLOAT;
+        return PrimaryDataType::INT;
+    }
+
     bool isTensorValued(const Ptr<ExprNode> &e)
     {
         if (auto lv = castPtr<LValueExprNode>(e))
-            return lv->indices.empty() && isArrayName(lv->identifier);
+            return isArrayName(lv->identifier) &&
+                   lv->indices.size() < shapes[lv->identifier].size();
         if (auto call = castPtr<CallExprNode>(e))
         {
             auto it = sigs.find(call->callee);
             return it != sigs.end() && it->second.hasSret;
         }
         if (auto un = castPtr<UnaryExprNode>(e))
-            return isTensorValued(un->operand);
+        {
+            if (un->op == UnaryOp::Plus || un->op == UnaryOp::Minus)
+                return isTensorValued(un->operand);
+            return false;
+        }
         if (auto b = castPtr<BinaryExprNode>(e))
         {
             if (b->op == BinaryOp::MatMul)
             {
                 Shape ls = inferShape(b->left, {});
                 Shape rs = inferShape(b->right, {});
-                //1维乘以1维是标量
                 return !(ls.size() == 1 && rs.size() == 1);
             }
             if (isElemOp(b->op))
@@ -170,14 +336,12 @@ struct Lowering
         }
         return false;
     }
-    //推断维度信息
+
     Shape inferShape(const Ptr<ExprNode> &e, const Shape &hint)
     {
         if (auto lv = castPtr<LValueExprNode>(e))
         {
-            if (!lv->indices.empty())
-                return {};
-            Shape s = shapes.count(lv->identifier) ? shapes[lv->identifier] : Shape{};
+            Shape s = remainingShape(lv->identifier, lv->indices.size());
             fillShape(s, hint);
             return s;
         }
@@ -185,7 +349,11 @@ struct Lowering
         {
             auto it = sigs.find(call->callee);
             if (it != sigs.end() && it->second.hasSret)
-                return it->second.retShape;
+            {
+                Shape s = it->second.retShape;
+                fillShape(s, hint);
+                return s;
+            }
             return {};
         }
         if (auto un = castPtr<UnaryExprNode>(e))
@@ -256,7 +424,7 @@ struct Lowering
         throw std::runtime_error("Omitted tensor first dimension cannot be inferred,line: " +
                                  std::to_string(line));
     }
-    ///生成循环
+
     void emitLoop(Ptr<ExprNode> limit, const std::function<void(const std::string &, Vector<Ptr<StmtNode>> &)> &body,
                   Vector<Ptr<StmtNode>> &out)
     {
@@ -267,7 +435,6 @@ struct Lowering
         inner.push_back(assign(lval(iv), bin(lval(iv), lit(1), BinaryOp::Add)));
         auto wh = makePtr<WhileStmtNode>(bin(lval(iv), std::move(limit), BinaryOp::Lt),
                                          makePtr<BlockStmtNode>(std::move(inner)));
-        //方便调试
         wh->line = 10000 + tmp;
         out.push_back(wh);
     }
@@ -295,7 +462,18 @@ struct Lowering
         Vector<Ptr<ExprNode>> idx;
         rec(0, idx, out);
     }
-    //[name,shape]
+
+    std::string pickBoundName(const Shape &sh, const std::string &dest, const std::string &src)
+    {
+        if (!sh.empty() && sh[0] > 0)
+            return dest;
+        if (extOf.count(src))
+            return src;
+        if (extOf.count(dest))
+            return dest;
+        return dest;
+    }
+
     std::pair<std::string, Shape> materialize(const Ptr<ExprNode> &e, const Shape &hint,
                                               Vector<Ptr<StmtNode>> &out)
     {
@@ -317,22 +495,77 @@ struct Lowering
                 throw std::runtime_error("Omitted tensor first dimension cannot be inferred,line: " +
                                          std::to_string(line));
         std::string name = fresh("__t");
-        out.push_back(declArray(name, PrimaryDataType::INT, s));
+        PrimaryDataType base = inferBase(e);
+        out.push_back(declArray(name, base, s));
         lowerInto(e, name, s, out);
         return {name, s};
     }
 
     Ptr<ExprNode> indexed(const std::string &name, const Vector<Ptr<ExprNode>> &idx)
     {
-        Vector<Ptr<ExprNode>> copy;
-        for (auto &i : idx)
-            copy.push_back(i);
-        return lval(name, std::move(copy));
+        return lval(name, cloneIdx(idx));
+    }
+
+    Ptr<ExprNode> extentOfLValue(const Ptr<LValueExprNode> &lv)
+    {
+        Shape rem = remainingShape(lv->identifier, lv->indices.size());
+        fillShape(rem, {});
+        if (!rem.empty() && rem[0] > 0)
+            return lit(rem[0]);
+        if (lv->indices.empty() && extOf.count(lv->identifier))
+            return lval(extOf[lv->identifier]);
+        throw std::runtime_error("Cannot pass tensor with unknown first dimension,line: " +
+                                 std::to_string(line));
+    }
+
+    void appendCallArgs(const FuncSig &sig, const Vector<Ptr<ExprNode>> &inArgs,
+                        Vector<Ptr<ExprNode>> &outArgs, Vector<Ptr<StmtNode>> &out)
+    {
+        for (size_t i = 0; i < inArgs.size(); ++i)
+        {
+            bool omit = i < sig.omitFirst.size() && sig.omitFirst[i];
+            if (isTensorValued(inArgs[i]))
+            {
+                if (auto lv = castPtr<LValueExprNode>(inArgs[i]))
+                {
+                    outArgs.push_back(lv);
+                    if (omit)
+                        outArgs.push_back(extentOfLValue(lv));
+                }
+                else
+                {
+                    auto [nm, sh] = materialize(inArgs[i], {}, out);
+                    outArgs.push_back(lval(nm));
+                    if (omit)
+                    {
+                        if (!sh.empty() && sh[0] > 0)
+                            outArgs.push_back(lit(sh[0]));
+                        else if (extOf.count(nm))
+                            outArgs.push_back(lval(extOf[nm]));
+                        else
+                            throw std::runtime_error("Cannot pass tensor with unknown first dimension,line: " +
+                                                     std::to_string(line));
+                    }
+                }
+            }
+            else
+            {
+                outArgs.push_back(lowerScalar(inArgs[i], out));
+                if (omit)
+                    throw std::runtime_error("Tensor parameter expects a tensor,line: " +
+                                             std::to_string(line));
+            }
+        }
     }
 
     void lowerInto(const Ptr<ExprNode> &e, const std::string &dest, const Shape &destSh,
                    Vector<Ptr<StmtNode>> &out)
     {
+        Shape sh = destSh;
+        fillShape(sh, inferShape(e, destSh));
+        if (shapes.count(dest))
+            fillShape(shapes[dest], sh);
+
         if (auto call = castPtr<CallExprNode>(e))
         {
             auto it = sigs.find(call->callee);
@@ -340,31 +573,7 @@ struct Lowering
                 throw std::runtime_error("Invalid tensor call,line: " + std::to_string(line));
             Vector<Ptr<ExprNode>> args;
             args.push_back(lval(dest));
-            for (size_t i = 0; i < call->args.size(); ++i)
-            {
-                if (isTensorValued(call->args[i]))
-                {
-                    auto [nm, sh] = materialize(call->args[i], {}, out);
-                    args.push_back(lval(nm));
-                    if (i < it->second.omitFirst.size() && it->second.omitFirst[i])
-                    {
-                        if (!sh.empty() && sh[0] > 0)
-                            args.push_back(lit(sh[0]));
-                        else if (extOf.count(nm))
-                            args.push_back(lval(extOf[nm]));
-                        else
-                            throw std::runtime_error("Cannot pass tensor with unknown first dimension,line: " +
-                                                     std::to_string(line));
-                    }
-                }
-                else
-                {
-                    args.push_back(call->args[i]);
-                    if (i < it->second.omitFirst.size() && it->second.omitFirst[i])
-                        throw std::runtime_error("Tensor parameter expects a tensor,line: " +
-                                                 std::to_string(line));
-                }
-            }
+            appendCallArgs(it->second, call->args, args, out);
             auto c = makePtr<CallExprNode>(call->callee, std::move(args));
             c->line = line;
             auto es = makePtr<ExprStmtNode>(c);
@@ -374,19 +583,20 @@ struct Lowering
         }
         if (auto lv = castPtr<LValueExprNode>(e))
         {
-            if (lv->indices.empty() && isArrayName(lv->identifier))
+            if (isArrayName(lv->identifier) &&
+                lv->indices.size() < shapes[lv->identifier].size())
             {
-                if (lv->identifier == dest)
+                if (lv->identifier == dest && lv->indices.empty())
                     return;
-                emitNest(destSh, dest, [&](const Vector<Ptr<ExprNode>> &idx, Vector<Ptr<StmtNode>> &b)
-                         { b.push_back(assign(lval(dest, [&]
-                                                   {
-                                                       Vector<Ptr<ExprNode>> c;
-                                                       for (auto &x : idx)
-                                                           c.push_back(x);
-                                                       return c;
-                                                   }()),
-                                              indexed(lv->identifier, idx))); },
+                std::string bound = pickBoundName(sh, dest, lv->identifier);
+                emitNest(sh, bound, [&](const Vector<Ptr<ExprNode>> &idx, Vector<Ptr<StmtNode>> &b)
+                         {
+                             Vector<Ptr<ExprNode>> srcIdx = cloneIdx(lv->indices);
+                             for (auto &x : idx)
+                                 srcIdx.push_back(x);
+                             b.push_back(assign(lval(dest, cloneIdx(idx)),
+                                                lval(lv->identifier, std::move(srcIdx))));
+                         },
                          out);
                 return;
             }
@@ -395,26 +605,18 @@ struct Lowering
         {
             if (un->op == UnaryOp::Plus)
             {
-                lowerInto(un->operand, dest, destSh, out);
+                lowerInto(un->operand, dest, sh, out);
                 return;
             }
             if (un->op == UnaryOp::Minus)
             {
-                auto [nm, sh] = materialize(un->operand, destSh, out);
-                emitNest(destSh, dest, [&](const Vector<Ptr<ExprNode>> &idx, Vector<Ptr<StmtNode>> &b)
+                auto [nm, nsh] = materialize(un->operand, sh, out);
+                std::string bound = pickBoundName(sh, dest, nm);
+                emitNest(sh, bound, [&](const Vector<Ptr<ExprNode>> &idx, Vector<Ptr<StmtNode>> &b)
                          {
-                             b.push_back(assign(lval(dest, [&]
-                                                     {
-                                                         Vector<Ptr<ExprNode>> c;
-                                                         for (auto &x : idx)
-                                                             c.push_back(x);
-                                                         return c;
-                                                     }()),
-                                                [&]() {
-                                                    auto u = makePtr<UnaryExprNode>(indexed(nm, idx), UnaryOp::Minus);
-                                                    u->line = line;
-                                                    return u;
-                                                }()));
+                             auto u = makePtr<UnaryExprNode>(indexed(nm, idx), UnaryOp::Minus);
+                             u->line = line;
+                             b.push_back(assign(lval(dest, cloneIdx(idx)), u));
                          },
                          out);
                 return;
@@ -424,7 +626,7 @@ struct Lowering
         {
             if (bop->op == BinaryOp::MatMul)
             {
-                emitMatMul(bop, dest, destSh, out);
+                emitMatMul(bop, dest, sh, out);
                 return;
             }
             if (isElemOp(bop->op))
@@ -432,21 +634,31 @@ struct Lowering
                 bool lT = isTensorValued(bop->left);
                 bool rT = isTensorValued(bop->right);
                 std::string ln, rn;
+                Shape ls, rs;
                 if (lT)
-                    ln = materialize(bop->left, destSh, out).first;
+                {
+                    auto p = materialize(bop->left, sh, out);
+                    ln = p.first;
+                    ls = p.second;
+                    fillShape(sh, ls);
+                }
                 if (rT)
-                    rn = materialize(bop->right, destSh, out).first;
-                emitNest(destSh, dest, [&](const Vector<Ptr<ExprNode>> &idx, Vector<Ptr<StmtNode>> &b)
+                {
+                    auto p = materialize(bop->right, sh, out);
+                    rn = p.first;
+                    rs = p.second;
+                    fillShape(sh, rs);
+                }
+                std::string bound = dest;
+                if (lT)
+                    bound = pickBoundName(sh, dest, ln);
+                if (rT && (sh.empty() || sh[0] <= 0 || bound == dest))
+                    bound = pickBoundName(sh, bound, rn);
+                emitNest(sh, bound, [&](const Vector<Ptr<ExprNode>> &idx, Vector<Ptr<StmtNode>> &b)
                          {
                              Ptr<ExprNode> a = lT ? indexed(ln, idx) : bop->left;
                              Ptr<ExprNode> c = rT ? indexed(rn, idx) : bop->right;
-                             b.push_back(assign(lval(dest, [&]
-                                                     {
-                                                         Vector<Ptr<ExprNode>> cp;
-                                                         for (auto &x : idx)
-                                                             cp.push_back(x);
-                                                         return cp;
-                                                     }()),
+                             b.push_back(assign(lval(dest, cloneIdx(idx)),
                                                 bin(std::move(a), std::move(c), bop->op)));
                          },
                          out);
@@ -461,6 +673,7 @@ struct Lowering
     {
         auto [ln, ld] = materialize(bop->left, {}, out);
         auto [rn, rd] = materialize(bop->right, {}, out);
+        PrimaryDataType accTy = bases.count(dest) ? bases[dest] : inferBase(bop);
         if (ld.size() == 2 && rd.size() == 2)
         {
             if (ld[1] < 0 && rd[0] > 0)
@@ -475,10 +688,8 @@ struct Lowering
             emitLoop(lit(M), [&](const std::string &i, Vector<Ptr<StmtNode>> &bi)
                      { emitLoop(lit(N), [&](const std::string &j, Vector<Ptr<StmtNode>> &bj)
                                 {
-                                    //累加器
                                     std::string acc = fresh("__acc");
-                                    bj.push_back(declScalar(acc, lit(0)));
-                                    //内层k
+                                    bj.push_back(declScalar(acc, zeroOf(accTy), accTy));
                                     emitLoop(lit(K), [&](const std::string &k, Vector<Ptr<StmtNode>> &bk)
                                              {
                                                  auto mul = bin(indexed(ln, {lval(i), lval(k)}),
@@ -504,7 +715,7 @@ struct Lowering
             emitLoop(lit(M), [&](const std::string &i, Vector<Ptr<StmtNode>> &bi)
                      {
                          std::string acc = fresh("__acc");
-                         bi.push_back(declScalar(acc, lit(0)));
+                         bi.push_back(declScalar(acc, zeroOf(accTy), accTy));
                          emitLoop(lit(K), [&](const std::string &k, Vector<Ptr<StmtNode>> &bk)
                                   {
                                       auto mul = bin(indexed(ln, {lval(i), lval(k)}), indexed(rn, {lval(k)}), BinaryOp::Mul);
@@ -527,7 +738,7 @@ struct Lowering
             emitLoop(lit(N), [&](const std::string &j, Vector<Ptr<StmtNode>> &bj)
                      {
                          std::string acc = fresh("__acc");
-                         bj.push_back(declScalar(acc, lit(0)));
+                         bj.push_back(declScalar(acc, zeroOf(accTy), accTy));
                          emitLoop(lit(K), [&](const std::string &k, Vector<Ptr<StmtNode>> &bk)
                                   {
                                       auto mul = bin(indexed(ln, {lval(k)}), indexed(rn, {lval(k), lval(j)}), BinaryOp::Mul);
@@ -548,12 +759,10 @@ struct Lowering
             return e;
         if (auto bop = castPtr<BinaryExprNode>(e))
         {
-            //点乘为3层循环单独处理一个
             if (bop->op == BinaryOp::MatMul)
             {
                 Shape ld = inferShape(bop->left, {});
                 Shape rd = inferShape(bop->right, {});
-                //a[][k]@b[k][]
                 if (ld.size() == 1 && rd.size() == 1)
                 {
                     auto [ln, ls] = materialize(bop->left, {}, out);
@@ -561,9 +770,9 @@ struct Lowering
                     int K = ls[0] > 0 ? ls[0] : rs[0];
                     if (K <= 0)
                         throw std::runtime_error("Inner product length unknown,line: " + std::to_string(line));
+                    PrimaryDataType accTy = inferBase(bop->left);
                     std::string acc = fresh("__acc");
-                    out.push_back(declScalar(acc, lit(0)));
-                    //生成一个内层循环
+                    out.push_back(declScalar(acc, zeroOf(accTy), accTy));
                     emitLoop(lit(K), [&](const std::string &k, Vector<Ptr<StmtNode>> &bk)
                              {
                                  auto mul = bin(indexed(ln, {lval(k)}), indexed(rn, {lval(k)}), BinaryOp::Mul);
@@ -592,36 +801,26 @@ struct Lowering
             if (it != sigs.end())
             {
                 Vector<Ptr<ExprNode>> args;
-                for (size_t i = 0; i < call->args.size(); ++i)
-                {
-                    if (isTensorValued(call->args[i]))
-                    {
-                        auto [nm, sh] = materialize(call->args[i], {}, out);
-                        args.push_back(lval(nm));
-                        if (i < it->second.omitFirst.size() && it->second.omitFirst[i])
-                        {
-                            if (!sh.empty() && sh[0] > 0)
-                                args.push_back(lit(sh[0]));
-                            else if (extOf.count(nm))
-                                args.push_back(lval(extOf[nm]));
-                            else
-                                throw std::runtime_error("Cannot pass tensor with unknown first dimension,line: " +
-                                                         std::to_string(line));
-                        }
-                    }
-                    else
-                    {
-                        args.push_back(lowerScalar(call->args[i], out));
-                        if (i < it->second.omitFirst.size() && it->second.omitFirst[i])
-                            throw std::runtime_error("Tensor parameter expects a tensor,line: " +
-                                                     std::to_string(line));
-                    }
-                }
+                appendCallArgs(it->second, call->args, args, out);
                 call->args = std::move(args);
             }
             return call;
         }
         return e;
+    }
+
+    void lowerInit(const Ptr<InitExprNode> &init, Vector<Ptr<StmtNode>> &out)
+    {
+        if (!init)
+            return;
+        if (init->singleInitVal)
+        {
+            if (isTensorValued(init->singleInitVal))
+                throw std::runtime_error("Tensor value used in initializer list,line: " + std::to_string(line));
+            init->singleInitVal = lowerScalar(init->singleInitVal, out);
+        }
+        for (auto &m : init->multiInitVal)
+            lowerInit(m, out);
     }
 
     Vector<Ptr<StmtNode>> lowerStmtList(const Vector<Ptr<StmtNode>> &stmts)
@@ -640,7 +839,7 @@ struct Lowering
         b->line = line;
         return b;
     }
-    //改写原来的语句
+
     void emitStmt(const Ptr<StmtNode> &s, Vector<Ptr<StmtNode>> &out)
     {
         if (!s)
@@ -648,45 +847,42 @@ struct Lowering
         line = s->line;
         if (auto blk = castPtr<BlockStmtNode>(s))
         {
+            pushScope();
             blk->stmts = lowerStmtList(blk->stmts);
+            popScope();
             out.push_back(blk);
             return;
         }
         if (auto decl = castPtr<DeclStmtNode>(s))
         {
+            noteConstDecl(decl);
             if (decl->type.isArray())
+                bindArray(decl->identifier, dimsOf(decl->type, constInts), decl->type.baseType);
+            else
+                bindScalar(decl->identifier);
+            if (decl->type.isArray() && decl->initializer && decl->initializer->singleInitVal &&
+                isTensorValued(decl->initializer->singleInitVal))
             {
-                shapes[decl->identifier] = dimsOf(decl->type);
-                bases[decl->identifier] = decl->type.baseType;
-                //修复张量初始化赋值
-                if (decl->initializer && decl->initializer->singleInitVal)
-                {
-                    Shape dsh=shapes[decl->identifier];
-                    auto initi=decl->initializer;
-                    decl->initializer=nullptr;
-                    out.push_back(decl);
-                    lowerInto(initi->singleInitVal,decl->identifier,dsh,out);
-                    return;
-                } 
+                Shape dsh = shapes[decl->identifier];
+                auto initi = decl->initializer;
+                decl->initializer = nullptr;
+                out.push_back(decl);
+                lowerInto(initi->singleInitVal, decl->identifier, dsh, out);
+                return;
             }
-            //这里目前有bug，tensor初始化列表赋值有问题
-            if (decl->initializer && decl->initializer->singleInitVal)
-            {
-                decl->initializer->singleInitVal = lowerScalar(decl->initializer->singleInitVal, out);
-            }
+            if (decl->initializer)
+                lowerInit(decl->initializer, out);
             out.push_back(decl);
             return;
         }
         if (auto asg = castPtr<AssignStmtNode>(s))
         {
-            //tensor赋值
             if (asg->lvalue->indices.empty() && isArrayName(asg->lvalue->identifier))
             {
                 Shape dsh = shapes[asg->lvalue->identifier];
                 lowerInto(asg->rvalue, asg->lvalue->identifier, dsh, out);
                 return;
             }
-            //表达式降为标量
             asg->rvalue = lowerScalar(asg->rvalue, out);
             out.push_back(asg);
             return;
@@ -695,7 +891,9 @@ struct Lowering
         {
             if (cur && cur->hasSret && ret->ret_expr)
             {
-                lowerInto(ret->ret_expr, "__sret", cur->retShape, out);
+                Shape dsh = cur->retShape;
+                fillShape(dsh, inferShape(ret->ret_expr, dsh));
+                lowerInto(ret->ret_expr, "__sret", dsh, out);
                 auto r = makePtr<ReturnStmtNode>(nullptr);
                 r->line = line;
                 out.push_back(r);
@@ -764,13 +962,14 @@ struct Lowering
     {
         auto savedShapes = shapes;
         auto savedBases = bases;
+        auto savedConsts = constInts;
         shapes.clear();
         bases.clear();
         for (auto &p : f->params)
         {
             if (p->type.isArray())
             {
-                shapes[p->identifier] = dimsOf(p->type);
+                shapes[p->identifier] = dimsOf(p->type, constInts);
                 bases[p->identifier] = p->type.baseType;
             }
         }
@@ -780,9 +979,10 @@ struct Lowering
                      {
                          if (auto d = castPtr<DeclStmtNode>(n))
                          {
+                             noteConstDecl(d);
                              if (d->type.isArray())
                              {
-                                 shapes[d->identifier] = dimsOf(d->type);
+                                 shapes[d->identifier] = dimsOf(d->type, constInts);
                                  bases[d->identifier] = d->type.baseType;
                              }
                          }
@@ -806,6 +1006,7 @@ struct Lowering
         }
         shapes = std::move(savedShapes);
         bases = std::move(savedBases);
+        constInts = std::move(savedConsts);
         return found;
     }
 
@@ -815,7 +1016,6 @@ struct Lowering
         auto userParams = f->params;
         if (f->returnType.isTensor)
         {
-            //tensor类型返回值要按照规则改写函数签名，这里改写返回类型
             sig.hasSret = true;
             sig.retShape = inferTensorReturnShape(f);
             sig.retBase = f->returnType.baseType;
@@ -832,16 +1032,14 @@ struct Lowering
         }
         else
             f->params.clear();
-        //重构函数参数类型
         for (auto &p : userParams)
         {
             f->params.push_back(p);
-            Shape sh = p->type.isArray() ? dimsOf(p->type) : Shape{};
+            Shape sh = p->type.isArray() ? dimsOf(p->type, constInts) : Shape{};
             sig.paramShapes.push_back(sh);
-            //是否为数组参数，省略维度这个时候indice传入是-1
-            char omit = (!sh.empty() && sh[0] < 0) ? 1 : 0;
+            // 仅 tensor 形参且省略第一维时，额外传入最外维长度
+            char omit = (p->type.isTensor && !sh.empty() && sh[0] < 0) ? 1 : 0;
             sig.omitFirst.push_back(omit);
-            //数组参数最外层维度，本来ir不需要，这里要添加用于推导函数内tensor类型
             if (omit)
             {
                 auto ext = makePtr<DeclStmtNode>(DataType(PrimaryDataType::INT), p->identifier + "__ext",
@@ -855,31 +1053,25 @@ struct Lowering
 
     void lowerFunc(Ptr<FuncNode> f)
     {
-        //进入新函数只保留全局的数据
-        shapes.clear();
-        shapes=gloabl_shapes;
-        bases.clear();
+        shapes = gloabl_shapes;
+        bases = gloabl_bases;
+        auto savedConsts = constInts;
         extOf.clear();
-        //函数签名
         cur = &sigs[f->identifier];
         tmp = 0;
+        pushScope();
         if (cur->hasSret)
         {
-            shapes["__sret"] = cur->retShape;
-            bases["__sret"] = cur->retBase;
+            bindArray("__sret", cur->retShape, cur->retBase);
         }
-        //如果有返回值则要插入一个ret数组把函数模板变为void
         size_t pi = cur->hasSret ? 1 : 0;
         for (size_t i = 0; i < cur->paramShapes.size(); ++i)
         {
             auto &p = f->params[pi++];
-            //记录函数形参形状
             if (!cur->paramShapes[i].empty())
-            {
-                shapes[p->identifier] = cur->paramShapes[i];
-                bases[p->identifier] = p->type.baseType;
-            }
-            //如果是数组则增加参数记录外层维度
+                bindArray(p->identifier, cur->paramShapes[i], p->type.baseType);
+            else
+                bindScalar(p->identifier);
             if (cur->omitFirst[i])
             {
                 auto &ext = f->params[pi++];
@@ -888,31 +1080,38 @@ struct Lowering
         }
         if (f->body)
             f->body->stmts = lowerStmtList(f->body->stmts);
+        popScope();
+        constInts = std::move(savedConsts);
         cur = nullptr;
     }
 };
 } // namespace
 
-//前端处理tensor的入口
 void ast::lowerTensors(std::shared_ptr<CompUnitNode> compUnit)
 {
-    //不含tensor不处理，不用lowering
-    if (!compUnit||!CompilerConfig::isTensorProgram)
+    if (!compUnit)
         return;
     Lowering L;
     for (auto &ch : compUnit->children)
     {
-        //全局声明
         if (auto d = castPtr<DeclStmtNode>(ch))
         {
+            L.noteConstDecl(d);
             if (d->type.isArray())
-                L.gloabl_shapes[d->identifier] = dimsOf(d->type);
+            {
+                L.gloabl_shapes[d->identifier] = dimsOf(d->type, L.constInts);
+                L.gloabl_bases[d->identifier] = d->type.baseType;
+            }
+            // 全局作用域不能生成循环，张量表达式初值只允许出现在函数内
+            if (d->type.isTensor && d->initializer && d->initializer->singleInitVal)
+            {
+                throw std::runtime_error("Global tensor expression initializer is not supported,line: " +
+                                         std::to_string(d->line));
+            }
         }
-        //如果是函数节点则重写函数签名
         else if (auto f = castPtr<FuncNode>(ch))
             L.rewriteSignature(f);
     }
-    //再遍历一遍，因为调用者要知道被调用者的返回类型才能推导本身的返回值类型
     for (auto &ch : compUnit->children)
     {
         if (auto f = castPtr<FuncNode>(ch))

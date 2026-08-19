@@ -160,7 +160,7 @@ int main(int argc, const char *argv[])
     //     return 1;
     // }
     ast::lowerTensors(ast_root);
-    ast_root->print(cout,0);
+    //ast_root->print(cout,0);
     // 这里修改输出的label
     IRBuilder irbuilder(debugMode,input_file);
     auto ir_module = irbuilder.buildModule(ast_root);

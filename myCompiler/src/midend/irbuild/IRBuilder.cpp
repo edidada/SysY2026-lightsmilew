@@ -1176,18 +1176,24 @@ Constant *IRBuilder::evaluateConstantArray(std::shared_ptr<ast::InitExprNode> no
     bool isAllZero = true;
     for (int i = 0; i < flat_inits.size(); i++)
     {
-        if (!flat_inits[i])
-            continue; // 如果是空指针，跳过
-        if (auto intLiteral = std::dynamic_pointer_cast<ast::IntLiteralExprNode>(flat_inits[i]->singleInitVal))
+        if (!flat_inits[i] || !flat_inits[i]->singleInitVal)
+            continue;
+        auto leaf = flat_inits[i]->singleInitVal;
+        if (auto intLiteral = std::dynamic_pointer_cast<ast::IntLiteralExprNode>(leaf))
         {
             if (intLiteral->value != 0)
-            {
                 isAllZero = false;
-                break;
-            }
-            else
-                continue; // 如果是0，继续
+            continue;
         }
+        if (auto floatLiteral = std::dynamic_pointer_cast<ast::FloatLiteralExprNode>(leaf))
+        {
+            if (floatLiteral->value != 0.0f)
+                isAllZero = false;
+            continue;
+        }
+        // 一元负号、常量表达式等：不能当成全 0 优化掉
+        isAllZero = false;
+        break;
     }
     // 示例{0，0，0}，如果全部为0，则返回nullptr
     // 这种情况下，表示数组没有实际初始值，可以优化为 nullptr，减小代码体积

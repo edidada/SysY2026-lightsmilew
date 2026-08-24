@@ -1801,11 +1801,38 @@ bool ArrayCopyPropagationPass::analyzeCopyLoop(const Loop &loop,
 
 bool ArrayCopyPropagationPass::isCopyPropagationSafe(const Loop &copyLoop,
                                                        Value *dstArray,
+                                                       Value *srcArray,
                                                        const vector<Loop> &allLoops) const
 {
-    if (!dstArray)
+    if (!dstArray || !srcArray)
     {
         return false;
+    }
+
+    // dst 是 src 的快照。若包围拷贝的循环仍写入 src（Jacobi：next=f(current)），
+    // 把 dst 改写成 src 会变成原地 Gauss-Seidel。
+    set<BasicBlock *> copyBlocks(copyLoop.blocks.begin(), copyLoop.blocks.end());
+    for (const auto &candidate : allLoops)
+    {
+        if (candidate.header == copyLoop.header || !candidate.containsBlock(copyLoop.header))
+        {
+            continue;
+        }
+        for (auto *bb : candidate.blocks)
+        {
+            if (!bb || copyBlocks.count(bb))
+            {
+                continue;
+            }
+            for (auto &instPtr : bb->getInstructions())
+            {
+                auto *store = dynamic_cast<StoreInst *>(instPtr.get());
+                if (store && storeTargetsBase(store->getPointer(), srcArray))
+                {
+                    return false;
+                }
+            }
+        }
     }
 
     const Loop *region = findCopyPropagationRegion(copyLoop, dstArray, allLoops);
@@ -2029,7 +2056,7 @@ bool ArrayCopyPropagationPass::runOnFunction(Function *func)
         {
             continue;
         }
-        if (!isCopyPropagationSafe(loop, pattern.dstArray, loops))
+        if (!isCopyPropagationSafe(loop, pattern.dstArray, pattern.srcArray, loops))
         {
             continue;
         }

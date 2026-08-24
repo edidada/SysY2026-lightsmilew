@@ -8,7 +8,7 @@ fi
 
 OUTPUT_DIR="assembles"
 CROSS_COMPILE="riscv64-linux-gnu-"
-TIMEOUT_SECONDS=150
+TIMEOUT_SECONDS="${TIMEOUT_SECONDS:-150}"
 TIME_LOG="time_history.log"
 # 含 RVV 指令时需 rv64gcv；可用 MARCH=rv64gc 覆盖
 MARCH="${MARCH:-rv64gcv}"

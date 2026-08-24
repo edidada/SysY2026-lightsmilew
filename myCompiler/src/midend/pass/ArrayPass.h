@@ -52,6 +52,7 @@ namespace optimization
         bool analyzeCopyLoop(const Loop &loop, CopyLoopPattern &pattern) const;
         bool isCopyPropagationSafe(const Loop &copyLoop,
                                    Value *dstArray,
+                                   Value *srcArray,
                                    const std::vector<Loop> &allLoops) const;
         void applyCopyPropagation(Function *func, const CopyLoopPattern &pattern) const;
         void redirectAndRemoveLoop(Function *func, const Loop &loop);

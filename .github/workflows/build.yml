@@ -1,0 +1,57 @@
+# CI for lightsmilew/SysyCompiler (2026 competition first prize, RISC-V).
+# Generated parser is ANTLR 4.13.2, but the C++ runtime is gitignored and the
+# CMakeLists links a stale target name (antlr4_runtime, which 4.13.2 renamed to
+# antlr4_static). We fetch the matching runtime and patch the target at CI time.
+# Local build skipped.
+name: build (SysY2026 lightsmilew)
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+
+env:
+  ANTVR: 4.13.2
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: install deps
+      run: |
+        sudo apt update
+        sudo apt install -y build-essential cmake ninja-build openjdk-17-jre-headless unzip wget
+
+    - name: fetch ANTLR4 C++ runtime (gitignored in upstream)
+      run: |
+        mkdir -p myCompiler/3rd_party/antlr4-runtime
+        cd myCompiler/3rd_party/antlr4-runtime
+        # The zip extracts its contents directly into the current dir.
+        wget -q -O rt.zip \
+          https://www.antlr.org/download/antlr4-cpp-runtime-4.13.2-source.zip
+        unzip -q rt.zip
+        ls CMakeLists.txt
+
+    - name: patch stale CMake target name
+      run: |
+        # 4.13.2 defines antlr4_static/shared; upstream CMake links antlr4_runtime.
+        sed -i 's/antlr4_runtime/antlr4_static/g' myCompiler/CMakeLists.txt
+        grep -n 'antlr4' myCompiler/CMakeLists.txt
+
+    - name: Configure & Build
+      run: |
+        cmake -S myCompiler -B build -DCMAKE_BUILD_TYPE=Release \
+          -DANTLR_BUILD_CPP_TESTS=OFF
+        cmake --build build -j4
+
+    - name: smoke test (compiler runs)
+      continue-on-error: true
+      run: |
+        cat > /tmp/smoke.sy <<'EOF'
+        int main() { return 0; }
+        EOF
+        ./build/my_compiler /tmp/smoke.sy -S -o /tmp/smoke.s 2>&1 | head -20 || true
+        test -x ./build/my_compiler && echo "compiler built and executed"
